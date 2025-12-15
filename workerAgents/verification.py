@@ -2,12 +2,20 @@ import asyncio
 import json
 from typing import TypedDict, Dict, Any, Optional
 from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI as genai
 from langgraph.graph import StateGraph, START, END
+
 from mcp.client import MCPClient
 from mcp.client.session import ClientSession
 from mcp.transport.http import HTTPTransport
 
+from langgraph.prebuilt import ToolNode, tools_condition
+
 load_dotenv()
+
+llm = genai(model= "gemini-2.5-pro",
+            temperature=0.2,
+            max_output_tokens=2048)
 
 #subset of the shard state relevant to verification agent
 class OrchestrationState(TypedDict, total=False):
