@@ -8,7 +8,8 @@ from typing import Any, Dict, Optional
 
 from datetime import datetime
 
-from mcp.server.fastmcp import FastMCP, ToolError
+from mcp.server.fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 # Config
 STORAGE_DIR = os.environ.get("MCP_STORAGE_DIR", "./storage")
@@ -18,6 +19,7 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 mcp = FastMCP("NBFC MCP Server", json_response=True)
 
 # --- Mock data: 10 synthetic customers (same as before)
+# THIS CONTAINS THE CUSTOMER INFO
 CUSTOMERS: Dict[str, Dict[str, Any]] = {
     "CUST001": {"customer_id":"CUST001","name":"Asha Verma","age":32,"city":"Pune","phone":"9810000001","email":"asha@example.com","pre_approved_limit":300000,"salary_monthly":60000,"credit_score":745},
     "CUST002": {"customer_id":"CUST002","name":"Rahul Sharma","age":29,"city":"Delhi","phone":"9810000002","email":"rahul@example.com","pre_approved_limit":200000,"salary_monthly":45000,"credit_score":712},
@@ -45,12 +47,12 @@ def compute_emi(P: float, annual_rate: float, n_months: int) -> float:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_customer_info(customer_id: str) -> Dict[str, Any]:
-    """Fetch customer basic info."""
+async def get_customer_info(customer_id: str) -> Dict[str, Any]:
+    """Fetch customer basic information based in customer_id."""
     cust = CUSTOMERS.get(customer_id)
     if not cust:
         raise ToolError(f"customer not found: {customer_id}")
-    return {"status": "ok", "result": cust}
+    return {"result": cust}
 
 
 @mcp.tool()
@@ -294,6 +296,4 @@ def fetch_resource(filename: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # HTTP transport is convenient for local testing & MCP Inspector
-    # You can also use the default stdio transport if you prefer.
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, path="/mcp")
+    mcp.run(transport="sse")
