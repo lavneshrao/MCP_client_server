@@ -56,20 +56,19 @@ async def get_customer_info(customer_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def verify_kyc(customer_id: str, phone: str) -> Dict[str, Any]:
-    """Verify phone (and mock-address) for a customer."""
+def verify_kyc(customer_id: str, phone: str, city: str) -> Dict[str, Any]:
+    """Verify phone and address(city) for a customer using customer_id."""
     cust = CUSTOMERS.get(customer_id)
     if not cust:
         raise ToolError(f"customer not found: {customer_id}")
 
-    phone_verified = cust.get("phone") == phone
-    # Address verification is mocked as always True, same as original
+    phone_verified = (cust.get("phone") == phone)
+    address_verified = (cust.get("city") == city)
     return {
-        "status": "ok",
         "result": {
             "phone_verified": phone_verified,
-            "address_verified": True,
-        },
+            "address_verified": address_verified,
+        }
     }
 
 
