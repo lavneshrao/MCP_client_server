@@ -204,9 +204,7 @@ def upload_salary_slip(
     }
 
 
-# PDF generation needs reportlab, same as your FastAPI code
-from reportlab.pdfgen import canvas  # type: ignore
-
+from reportlab.pdfgen import canvas  
 
 @mcp.tool()
 def generate_sanction_letter(
@@ -215,7 +213,7 @@ def generate_sanction_letter(
     tenure_months: int = 36,
     interest_rate: float = 12.0,
 ) -> Dict[str, Any]:
-    """Generate a sanction letter PDF and return a resource URL."""
+    """Generate a sanction letter PDF and return a resource URL and path."""
     cust = CUSTOMERS.get(customer_id)
     if not cust:
         raise ToolError(f"customer not found: {customer_id}")
@@ -241,10 +239,9 @@ def generate_sanction_letter(
 
     resource_url = f"resource://{filename}"
     return {
-        "status": "ok",
         "result": {
-            "resource": resource_url,
-            "path": path,
+            "sanction_letter_resource": resource_url,
+            "sanction_letter_path": path,
         },
     }
 

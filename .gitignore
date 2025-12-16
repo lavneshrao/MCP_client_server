@@ -1,2 +1,5 @@
 .env
 myenv
+storage
+downloads
+MCPServer/__pycache__
