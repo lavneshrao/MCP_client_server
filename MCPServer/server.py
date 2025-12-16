@@ -11,7 +11,8 @@ from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-# Config
+from decimal import Decimal, getcontext
+
 STORAGE_DIR = os.environ.get("MCP_STORAGE_DIR", "./storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
@@ -35,12 +36,14 @@ CUSTOMERS: Dict[str, Dict[str, Any]] = {
 
 # --- Helper: EMI calculation (same math as before)
 def compute_emi(P: float, annual_rate: float, n_months: int) -> float:
-    r = annual_rate / 12.0 / 100.0
+    P = Decimal(P)
+    n_months = Decimal(n_months)
+    r = Decimal(annual_rate) / Decimal(12) / Decimal(100)
     if r == 0:
-        return P / n_months
-    num = P * r * (1 + r) ** n_months
-    den = (1 + r) ** n_months - 1
-    return num / den
+        return float(P/ n_months)
+    pow_factor = (1 + r) ** n_months
+    emi = P * r * (pow_factor / (pow_factor - 1))
+    return float(round(emi, 2))
 
 # ---------------------------------------------------------------------------
 # TOOLS
@@ -74,12 +77,11 @@ def verify_kyc(customer_id: str, phone: str, city: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def get_credit_score(customer_id: str) -> Dict[str, Any]:
-    """Return credit score for customer."""
+    """Return credit score for customer using there customer id."""
     cust = CUSTOMERS.get(customer_id)
     if not cust:
         raise ToolError(f"customer not found: {customer_id}")
     return {
-        "status": "ok",
         "result": {"credit_score": cust.get("credit_score")},
     }
 
@@ -93,7 +95,7 @@ def underwrite_loan(
     salary_provided: Optional[int] = None,
     salary_slip_resource: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Underwriting decision using stated rules."""
+    """Underwriting decision using stated rules and return decision and reason of approval or rejection."""
     cust = CUSTOMERS.get(customer_id)
     if not cust:
         raise ToolError(f"customer not found: {customer_id}")
@@ -105,33 +107,34 @@ def underwrite_loan(
 
     if score < 700:
         return {
-            "status": "ok",
             "result": {
                 "decision": "reject",
                 "reason": "credit_score_below_700",
-                "credit_score": score,
-            },
+                "emi": "not calculated",
+                "salary_slip_resource": salary_slip_resource
+            }
         }
 
     if requested <= pre_limit:
         emi = compute_emi(requested, annual_rate, tenure)
         return {
-            "status": "ok",
             "result": {
                 "decision": "approve",
-                "emi": emi,
                 "reason": "within_pre_approved_limit",
-            },
+                "emi": emi,
+                "salary_slip_resource": salary_slip_resource
+            }
         }
 
     if requested <= 2 * pre_limit:
         if not salary_slip_resource and salary_provided is None:
             return {
-                "status": "ok",
                 "result": {
                     "decision": "require_salary_slip",
                     "reason": "salary_slip_required",
-                },
+                    "emi": "not calculated",
+                    "salary_slip_resource": salary_slip_resource
+                }
             }
 
         salary = (
@@ -143,31 +146,29 @@ def underwrite_loan(
 
         if emi <= 0.5 * salary:
             return {
-                "status": "ok",
                 "result": {
                     "decision": "approve",
-                    "emi": emi,
                     "reason": "emi_within_50pct_salary",
+                    "emi": emi,
+                    "salary_slip_resource": salary_slip_resource
                 },
             }
         else:
             return {
-                "status": "ok",
                 "result": {
                     "decision": "reject",
                     "reason": "emi_exceeds_50pct_salary",
                     "emi": emi,
-                    "salary_monthly": salary,
+                    "salary_slip_resource": salary_slip_resource
                 },
             }
 
     return {
-        "status": "ok",
         "result": {
             "decision": "reject",
             "reason": "amount_exceeds_2x_pre_approved",
-            "pre_limit": pre_limit,
-            "requested": requested,
+            "emi": "not calculated",
+            "salary_slip_resource": salary_slip_resource
         },
     }
 
@@ -175,19 +176,17 @@ def underwrite_loan(
 @mcp.tool()
 def upload_salary_slip(
     customer_id: str,
-    filename: str,
-    content_base64: str,
+    content_base64: str="VGhpcyBpcyBhIGRlbW8gc2FsYXJ5IHNsaXA=",
 ) -> Dict[str, Any]:
     """
-    Upload a salary slip for a customer.
+    Upload a salary slip for a customer by using writing the content_base_64 in a file and saving 
+    it in the given location.
 
-    Note: in FastAPI this was multipart/form-data.
-    In MCP we pass base64-encoded file content instead.
     """
     if customer_id not in CUSTOMERS:
         raise ToolError(f"customer not found: {customer_id}")
 
-    ext = os.path.splitext(filename)[1] or ".pdf"
+    ext = ".pdf"
     stored_name = f"salary_{customer_id}_{uuid.uuid4().hex}{ext}"
     path = os.path.join(STORAGE_DIR, stored_name)
 
@@ -200,12 +199,8 @@ def upload_salary_slip(
         f.write(raw)
 
     resource_url = f"resource://{stored_name}"
-    return {
-        "status": "ok",
-        "result": {
-            "resource": resource_url,
-            "path": path,
-        },
+    return {        
+            "salary_slip_resource": resource_url
     }
 
 
