@@ -2,7 +2,7 @@ import asyncio
 import json
 from typing import TypedDict, Dict, Any, Annotated, List
 from pydantic import Field, create_model
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from langchain_core.tools import StructuredTool
 
@@ -10,21 +10,13 @@ from dotenv import load_dotenv
 
 from langchain_google_genai import ChatGoogleGenerativeAI as genai
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from mcp.client.session import ClientSession
-from mcp.client.sse import sse_client
 
+from sharedState.state import OrchestratorState
 
 load_dotenv()
-
-#subset of the shard state relevant to verification agent
-class VerificationAgentState(TypedDict, total=False):
-    customer_id: str 
-    customer_info: Dict[str, Any]
-    kyc_result: Dict[str, Any]
-    kyc_status: str
-    messages: Annotated[List[BaseMessage], add_messages]
 
 def mcp_to_langchain_tool(mcp_tool, session):
     
@@ -61,7 +53,7 @@ def mcp_to_langchain_tool(mcp_tool, session):
 
 async def build_verification_graph(session: ClientSession):
 
-    llm = genai(model= "gemini-2.5-flash-lite",
+    llm = genai(model= "gemini-2.5-flash",
             temperature=0.2,
             max_output_tokens=2048)
     
@@ -69,78 +61,10 @@ async def build_verification_graph(session: ClientSession):
     tools = [mcp_to_langchain_tool(t,session) for t in mcp_tools_list.tools]
     
     # NODE 1 
-    async def llm_node(state: VerificationAgentState):
+    async def llm_node(state: OrchestratorState):
         llm_with_tools = llm.bind_tools(tools)
 
-        response = await llm_with_tools.ainvoke(state["messages"])
-        return {"messages" : [response]}
-    
-    # NODE 2
-    tool_node = ToolNode(tools)
-
-    # NODE 3
-    def final_status_node(state: VerificationAgentState):
-        messages = state["messages"]
-        last_tool_msg = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
-        kyc_result = {}
-        status = "failed"
-
-        if last_tool_msg is not None:
-            try:
-                kyc_result = json.loads(last_tool_msg.content)
-            except:
-                kyc_result = {"raw": last_tool_msg.content}
-            
-    
-            result = kyc_result.get("result")
-            p_verified = result.get("phone_verified", False)
-            a_verified = result.get("address_verified", False)
-            
-
-            if p_verified and a_verified:
-                status = "verified"
-            elif p_verified or a_verified:
-                status = "pending"
-            else:
-                status = "failed"
-        
-        return {"kyc_status": status, "kyc_result": kyc_result}
-        
-
-    graph = StateGraph(VerificationAgentState)
-    graph.add_node("llm_node", llm_node)
-    graph.add_node("tool_node", tool_node)
-    graph.add_node("final_logic", final_status_node)
-
-    graph.add_edge(START, "llm_node")
-    graph.add_conditional_edges("llm_node", tools_condition, {"tools": "tool_node", END : "final_logic" })
-    graph.add_edge("tool_node", "llm_node")
-    graph.add_edge("final_logic", END)
-    return graph.compile()
-
-async def main():
-
-    server_url = "http://127.0.0.1:8000/sse"
-    header = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream"
-    }
-    timeout = 30.0
-
-    async with sse_client(server_url,headers=header, timeout=timeout) as streams:
-        read_stream, write_stream = streams
-        async with ClientSession(read_stream, write_stream) as session:
-            print("Successfully connected to MCP server")
-
-            await session.initialize()
-        
-            agent = await build_verification_graph(session)
-
-            #HERE MAKE THE VERIFICATION AGENT FETCH DETAIL FROM ORCHESTRATOR SHARED STATE
-            customer_id = "CUST005"
-            customer_info = {"customer_id":"CUST005","name":"Nisha Patel","age":27,"city":"Ahmedabad","phone":"9810000005","email":"nisha@example.com","pre_approved_limit":250000,"salary_monthly":52000,"credit_score":710}
-            
-            inputMessage = f'''
+        inputMessage = f'''
                             You are a KYC Verification Agent in a state-based workflow. You are not a chat assistant. You are a function-calling engine. 
                             You MUST call the 'verify_kyc' tool immediately.
 
@@ -164,31 +88,67 @@ async def main():
                             - `kyc_status`: "verified", "pending", or "failed"
 
                             Input:
-                            customer_id is {customer_id}
-                            customer_phone is {customer_info.get("phone","")}
-                            customer_address is {customer_info.get("city","")}
+                            customer_id is {state.get("customer_id")}
+                            customer_phone is {state.get("customer_info").get("phone","")}
+                            customer_address is {state.get("customer_info").get("city","")}
                             '''
+
+        existing_history = state.get("verification_messages",[])
+        response = await llm_with_tools.ainvoke(existing_history+ [HumanMessage(content=inputMessage)])
+
+        return {"verification_messages" : [response]}
+    
+    # NODE 2
+    tool_node = ToolNode(tools, messages_key="verification_messages")
+
+    # NODE 3
+    def final_status_node(state: OrchestratorState):
+        messages = state["verification_messages"]
+        last_tool_msg = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
+        kyc_result = {}
+        status = "failed"
+
+        if last_tool_msg is not None:
+            try:
+                kyc_result = json.loads(last_tool_msg.content)
+            except:
+                kyc_result = {"raw": last_tool_msg.content}
             
+    
+            result = kyc_result.get("result")
+            p_verified = result.get("phone_verified", False)
+            a_verified = result.get("address_verified", False)
             
-            init: VerificationAgentState = {
-                "customer_id": customer_id,
-                "customer_info": customer_info,
-                "messages" : [HumanMessage(content=inputMessage)]
-            }
 
+            if p_verified and a_verified:
+                status = "verified"
+            elif p_verified or a_verified:
+                status = "pending"
+            else:
+                status = "failed"
+        
+        public_history = AIMessage(
+            content=f"Verification Agent: Verified customer status is {status}",
+            name="VerificationAgent"
+        )
+        
+        return {"kyc_status": status, "kyc_result": kyc_result, "messages": [public_history]}
+        
+    def custom_tools_condition(state: OrchestratorState):
+            messages = state.get("verification_messages", [])
+            if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
+                return "tools"
+            return END
+    
 
-            final_state = await agent.ainvoke(init)
+    graph = StateGraph(OrchestratorState)
+    graph.add_node("llm_node", llm_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_node("final_logic", final_status_node)
 
-            # Create a clean dictionary for printing, excluding the raw 'messages' objects
-            output = {
-                "customer_id": final_state.get("customer_id"),
-                "customer_info": final_state.get("customer_info"),
-                "kyc_status": final_state.get("kyc_status"),
-                "kyc_result": final_state.get("kyc_result")
-            }
-            # HERE RETURN THE OUTPUT AND NOT THE EXACT STATE
-            print(json.dumps(output, indent=2))
+    graph.add_edge(START, "llm_node")
+    graph.add_conditional_edges("llm_node", custom_tools_condition, {"tools": "tool_node", END : "final_logic" })
+    graph.add_edge("tool_node", "llm_node")
+    graph.add_edge("final_logic", END)
+    return graph.compile()
 
-
-if __name__ == "__main__":
-    asyncio.run(main())

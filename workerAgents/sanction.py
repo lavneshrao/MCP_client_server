@@ -1,39 +1,24 @@
-import asyncio
 import json
 import os
 
-from typing import TypedDict, Dict, Any, Optional, Annotated, List
 from pydantic import Field, create_model
 
 from dotenv import load_dotenv
 
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import  HumanMessage, ToolMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI as genai
-from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
 from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 
 from mcp.client.session import ClientSession
-from mcp.client.sse import sse_client
+
+from sharedState.state import OrchestratorState
 
 load_dotenv()
 
 DOWNLOAD_DIR = os.environ.get("SANCTION_DOWNLOAD_DIR", "./downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-#subset of the shard state relevant to sanction agent
-class SanctionAgentState(TypedDict, total=False):
-    customer_id: str
-    underwriting_result: Dict[str, Any]
-    underwriting_status: str
-    negotiated_offer: Dict[str, Any]
-
-    sanction_letter_resource: Optional[str]
-    sanction_letter_path: Optional[str]
-    sanction_letter_status: Optional[str]   # "generated" | "failed"
-
-    messages: Annotated[List[BaseMessage],add_messages]
 
 
 def mcp_to_langchain_tool(mcp_tool, session):
@@ -71,7 +56,7 @@ def mcp_to_langchain_tool(mcp_tool, session):
 
 async def build_sanction_graph(session: ClientSession):
 
-    llm = genai(model= "gemini-2.5-flash-lite",
+    llm = genai(model= "gemini-2.5-flash",
             temperature=0.2,
             max_output_tokens=2048)
     
@@ -80,99 +65,10 @@ async def build_sanction_graph(session: ClientSession):
     tools = [mcp_to_langchain_tool(t,session) for t in mcp_tools_list.tools]
 
     # NODE 1 -> LLM Node
-    async def llm_node(state: SanctionAgentState):
+    async def llm_node(state: OrchestratorState):
         llm_with_tools = llm.bind_tools(tools)
 
-        response = await llm_with_tools.ainvoke(state["messages"])
-        return {"messages" : [response]}
-    
-    # NODE 2 -> TOOL NODE
-    tool_node = ToolNode(tools)
-
-    # NODE 3 
-    def final_status_node(state: SanctionAgentState):
-        messages = state["messages"]
-        last_tool_msg = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
-        sanction_result = {}
-        status = "failed"
-
-        if last_tool_msg is not None:
-
-            try:
-                sanction_result = json.loads(last_tool_msg.content)
-            except:
-                sanction_result = {"raw": last_tool_msg.content}
-            
-            result = sanction_result.get("result", {})
-            
-            if not isinstance(result, dict):
-                 result = {}
-
-            resource = result.get("sanction_letter_resource", None)
-            path = result.get("sanction_letter_path", None)
-
-            if resource is not None and path is not None:
-                status = "generated"
-            
-            state["sanction_letter_resource"] = resource
-            state["sanction_letter_path"] = path
-            state["sanction_letter_status"] = status
-        
-        else:
-             print("\n[DEBUG] No tool execution found in messages.\n")
-        
-        return state
-
-    graph = StateGraph(SanctionAgentState)
-
-    graph.add_node("llm_node", llm_node)
-    graph.add_node("tool_node", tool_node)
-    graph.add_node("final_logic", final_status_node)
-
-    graph.add_edge(START, "llm_node")
-    graph.add_conditional_edges("llm_node", tools_condition, {"tools": "tool_node", END : "final_logic" })
-    graph.add_edge("tool_node", "llm_node")
-    graph.add_edge("final_logic", END)
-
-    return graph.compile()
-
-
-async def main():
-
-    server_url = "http://127.0.0.1:8000/sse"
-    header = {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream"
-    }
-    timeout = 30.0
-
-    async with sse_client(server_url,headers=header, timeout=timeout) as streams:
-        read_stream, write_stream = streams
-        async with ClientSession(read_stream, write_stream) as session:
-            print("Successfully connected to MCP server")
-
-            await session.initialize()
-
-            agent = await build_sanction_graph(session)
-
-            #HERE MAKE THE SANCTION AGENT FETCH DETAIL FROM ORCHESTRATOR SHARED STATE
-            customer_id = "CUST010"
-            negotiated_offer = {
-                    "customer_id": "CUST010",
-                    "approved_amount": 250000,
-                    "tenure_months": 36,
-                    "interest_rate": 11.5,
-                    "justification": "Strong credit, within pre-approved"
-                }
-            underwriting_result = {
-                    "decision": "approve",
-                    "emi": 8250.0,
-                    "reason": "within_pre_approved_limit",
-                    "salary_slip_resource": None
-                }
-            underwriting_status = "approve"
-
-            inputMessage = f'''
+        inputMessage = f'''
                             You are an NBFC Sanction agent in a state-based workflow. You are not a chat assistant. You are a function-calling engine.
                             You have to utilise "generate_sanction_letter" tool immediately and only once.
 
@@ -197,43 +93,79 @@ async def main():
                             - `sanction_letter_status`: 'generated' or 'failed' based on whether sanction_letter_resource and sanction_letter_path are present
 
                             Input:
-                            customer_id is {customer_id}
-                            amount is {negotiated_offer["approved_amount"]}
-                            tenure_months is {negotiated_offer["tenure_months"]}
-                            interest_rate is {negotiated_offer["interest_rate"]}
-                            underwriting_status is {underwriting_status}
+                            customer_id is {state.get("customer_id")}
+                            amount is {state.get("negotiated_offer").get("approved_amount")}
+                            tenure_months is {state.get("negotiated_offer").get("tenure_months")}
+                            interest_rate is {state.get("negotiated_offer").get("interest_rate")}
+                            underwriting_status is {state.get("underwriting_status")}
                             '''
 
+        existing_history = state.get("sanction_messages",[])
 
-            init: SanctionAgentState = {
-                "customer_id": customer_id,
-                "negotiated_offer": negotiated_offer,
-                "underwriting_result": underwriting_result,
-                "underwriting_status": underwriting_status,
-                "sanction_letter_resource": None,
-                "sanction_letter_path": None,
-                "sanction_letter_status": None,
-                "messages" : [HumanMessage(content=inputMessage)]
-            }
+        response = await llm_with_tools.ainvoke(existing_history + [HumanMessage(content=inputMessage)])
+        return {"sanction_messages" : [response]}
+    
+    # NODE 2 -> TOOL NODE
+    tool_node = ToolNode(tools, messages_key="sanction_messages")
 
-            final_state = await agent.ainvoke(init)
+    # NODE 3 
+    def final_status_node(state: OrchestratorState):
+        messages = state["sanction_messages"]
+        last_tool_msg = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
+        sanction_result = {}
+        status = "failed"
 
-             # Create a clean dictionary for printing, excluding the raw 'messages' objects
-            output = {
-                "customer_id": customer_id,
-                "negotiated_offer": negotiated_offer,
-                "underwriting_result": underwriting_result,
-                "underwriting_status": underwriting_status,
-                "sanction_letter_resource": final_state["sanction_letter_resource"],
-                "sanction_letter_path": final_state["sanction_letter_path"],
-                "sanction_letter_status": final_state["sanction_letter_status"],
-            }
+        if last_tool_msg is not None:
 
-            # HERE RETURN THE OUTPUT AND NOT THE EXACT STATE
-            print(json.dumps(output, indent=2))
+            try:
+                sanction_result = json.loads(last_tool_msg.content)
+            except:
+                sanction_result = {"raw": last_tool_msg.content}
             
+            result = sanction_result.get("result", {})
             
+            if not isinstance(result, dict):
+                result = {}
+
+            resource = result.get("sanction_letter_resource", None)
+            path = result.get("sanction_letter_path", None)
+
+            if resource is not None and path is not None:
+                status = "generated"
+            
+            updates={}
+            updates["sanction_letter_resource"] = resource
+            updates["sanction_letter_path"] = path
+            updates["sanction_letter_status"] = status
+
+            public_history = AIMessage(
+            content=f'''Sanction Agent: Customer's sanction letter generation is {updates.get("sanction_letter_status")}''',
+            name="SanctionAgent"
+             )       
+            updates["messages"] = [public_history]
+        
+        else:
+             print("\n[DEBUG] No tool execution found in messages.\n")
+        
+        return updates
+
+    graph = StateGraph(OrchestratorState)
+
+    graph.add_node("llm_node", llm_node)
+    graph.add_node("tool_node", tool_node)
+    graph.add_node("final_logic", final_status_node)
+
+    def custom_tools_condition(state: OrchestratorState):
+            messages = state.get("sanction_messages", [])
+            if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
+                return "tools"
+            return END
+
+    graph.add_edge(START, "llm_node")
+    graph.add_conditional_edges("llm_node", custom_tools_condition, {"tools": "tool_node", END : "final_logic" })
+    graph.add_edge("tool_node", "llm_node")
+    graph.add_edge("final_logic", END)
+
+    return graph.compile()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())

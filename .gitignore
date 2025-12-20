@@ -3,3 +3,5 @@ myenv
 storage
 downloads
 MCPServer/__pycache__
+__pycache__/
+workerAgents/__pycache__/
